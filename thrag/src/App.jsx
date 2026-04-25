@@ -15,6 +15,12 @@ const emptyChooseSoftwareForm = {
   dataRequirements: '',
 }
 
+const emptyVetSoftwareForm = {
+  modelName: '',
+  intendedUse: '',
+  deploymentContext: '',
+}
+
 const defaultDetailHints = {
   riskAssessment:
     'Example: We need low hallucination risk, auditability, strong access controls, and clear human review checkpoints.',
@@ -206,6 +212,9 @@ function App() {
   const [currentFeedbackIndex, setCurrentFeedbackIndex] = useState(0)
   const [questionCache, setQuestionCache] = useState({})
   const [isTestingModel, setIsTestingModel] = useState(false)
+  const [vetSoftwareForm, setVetSoftwareForm] = useState(emptyVetSoftwareForm)
+  const [vetSoftwareReport, setVetSoftwareReport] = useState('')
+  const [isGeneratingVetReport, setIsGeneratingVetReport] = useState(false)
   const [session, setSession] = useState(null)
   const [isLoadingSession, setIsLoadingSession] = useState(Boolean(supabase))
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -307,11 +316,21 @@ function App() {
     setFeedbackIterations([])
     setCurrentFeedbackIndex(0)
     setQuestionCache({})
+    setVetSoftwareForm(emptyVetSoftwareForm)
+    setVetSoftwareReport('')
   }
 
   function updateChooseSoftwareForm(event) {
     const { name, value } = event.target
     setChooseSoftwareForm((currentForm) => ({
+      ...currentForm,
+      [name]: value,
+    }))
+  }
+
+  function updateVetSoftwareForm(event) {
+    const { name, value } = event.target
+    setVetSoftwareForm((currentForm) => ({
       ...currentForm,
       [name]: value,
     }))
@@ -343,6 +362,63 @@ function App() {
     }
 
     return reply
+  }
+
+  async function handleVetSoftwareSubmit(event) {
+    event.preventDefault()
+    setError('')
+    setNotice('')
+    setVetSoftwareReport('')
+    setIsGeneratingVetReport(true)
+
+    const userMessage = `You are an AI governance and model risk analyst.
+
+Generate a detailed, complete, decision-ready risk assessment report for the AI model provided by the user.
+
+Model details:
+${JSON.stringify(vetSoftwareForm, null, 2)}
+
+Output requirements:
+- Title: "Risk Assessment Report: <model name>"
+- Write in markdown with clear headings and bullet points.
+- Include all sections below and do not skip any:
+  1) Executive risk summary
+     - Business objective, deployment context, key assumptions, and top 3 risk drivers.
+  2) Primary risk categories
+     - Cover: safety, security, compliance/legal, privacy, reliability, misuse.
+     - For each category include:
+       - threat or failure scenarios (at least 2)
+       - potential impact (operational, legal, financial, reputational)
+       - inherent risk level (high/medium/low) with rationale
+       - residual risk level after controls
+  3) Severity matrix table
+     - Provide a markdown table with columns:
+       | Risk Category | Likelihood | Impact | Inherent Severity | Key Evidence | Residual Severity |
+  4) Required controls and mitigations before production
+     - Preventive, detective, and corrective controls.
+     - Include owner role, implementation priority (P0/P1/P2), and acceptance criteria for each control.
+  5) Validation and monitoring plan
+     - Pre-launch test plan, red-team/abuse tests, performance thresholds, drift monitoring, alerting thresholds, and incident response steps.
+  6) Governance and compliance checklist
+     - Data handling, retention, access controls, audit logging, human oversight, policy approvals, and documentation artifacts.
+  7) Final recommendation
+     - Go / Go-with-conditions / No-go.
+     - If conditional, provide explicit launch gates and what evidence must be collected before approval.
+
+Formatting and quality rules:
+- Be specific and actionable, not generic.
+- Expand each section with enough detail to be usable by security, legal, and engineering teams.
+- If details are missing, state assumptions explicitly and explain how they affect risk ratings.
+- Do not recommend alternative models unless needed for mitigation context.`
+
+    try {
+      const reply = await requestVllmReply(userMessage)
+      setVetSoftwareReport(reply)
+    } catch (requestError) {
+      setError(requestError.message)
+    } finally {
+      setIsGeneratingVetReport(false)
+    }
   }
 
   function updateFeedbackAnswer(iterationIndex, questionIndex, value) {
@@ -636,6 +712,8 @@ Rules:
     setChooseStep('tool')
     setDetailHints(defaultDetailHints)
     setFeedbackIterations([])
+    setVetSoftwareForm(emptyVetSoftwareForm)
+    setVetSoftwareReport('')
   }
 
   async function goToChooseDetails(event) {
@@ -1006,23 +1084,83 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
           )}
 
           {activeWorkflow === 'vet-software' && (
-            <section className="workflow-form" aria-live="polite">
+            <form
+              className="workflow-form"
+              aria-live="polite"
+              onSubmit={handleVetSoftwareSubmit}
+            >
               <div>
                 <p className="eyebrow">Vetting an AI tool</p>
-                <h2>AI tool vetting will come next</h2>
+                <h2>Generate an AI model risk assessment</h2>
                 <p>
-                  This branch will collect the AI tool name and your tech stack
-                  when the vetting flow is implemented.
+                  Enter the model and context, then generate a risk-focused report
+                  from vLLM.
                 </p>
               </div>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={resetWorkflow}
-              >
-                Back
-              </button>
-            </section>
+
+              <label>
+                AI model
+                <input
+                  name="modelName"
+                  onChange={updateVetSoftwareForm}
+                  placeholder="Example: meta-llama/Llama-3.1-8B-Instruct"
+                  required
+                  type="text"
+                  value={vetSoftwareForm.modelName}
+                />
+              </label>
+
+              <label>
+                Intended use
+                <textarea
+                  name="intendedUse"
+                  onChange={updateVetSoftwareForm}
+                  placeholder="Example: Internal support copilot for drafting responses and summarizing incidents."
+                  rows="3"
+                  value={vetSoftwareForm.intendedUse}
+                />
+              </label>
+
+              <label>
+                Deployment context
+                <textarea
+                  name="deploymentContext"
+                  onChange={updateVetSoftwareForm}
+                  placeholder="Example: Runs in a private VPC, serves 200 analysts, handles customer account notes."
+                  rows="3"
+                  value={vetSoftwareForm.deploymentContext}
+                />
+              </label>
+
+              <div className="form-actions">
+                <div className="form-actions-left">
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={isGeneratingVetReport}
+                    onClick={resetWorkflow}
+                  >
+                    Back
+                  </button>
+                </div>
+                <div className="form-actions-right">
+                  <button
+                    className="primary-button"
+                    disabled={isGeneratingVetReport}
+                    type="submit"
+                  >
+                    {isGeneratingVetReport ? 'Generating report...' : 'Generate risk report'}
+                  </button>
+                </div>
+              </div>
+
+              {vetSoftwareReport && (
+                <div className="model-response" aria-live="polite">
+                  <h3>vLLM risk assessment report</h3>
+                  <p>{vetSoftwareReport}</p>
+                </div>
+              )}
+            </form>
           )}
 
           {error && <p className="alert error">{error}</p>}

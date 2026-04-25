@@ -128,6 +128,31 @@ function normalizeQuestionText(question) {
     .trim()
 }
 
+function isSimilarQuestion(question, previousQuestion) {
+  const currentWords = new Set(
+    normalizeQuestionText(question)
+      .split(' ')
+      .filter((word) => word.length > 3),
+  )
+  const previousWords = new Set(
+    normalizeQuestionText(previousQuestion)
+      .split(' ')
+      .filter((word) => word.length > 3),
+  )
+
+  if (currentWords.size === 0 || previousWords.size === 0) {
+    return false
+  }
+
+  const sharedWordCount = [...currentWords].filter((word) =>
+    previousWords.has(word),
+  ).length
+  const overlapRatio =
+    sharedWordCount / Math.min(currentWords.size, previousWords.size)
+
+  return overlapRatio >= 0.7
+}
+
 function getPreviousQuestions(iterations) {
   return iterations.flatMap((iteration) => iteration.questions)
 }
@@ -138,8 +163,15 @@ function removeRepeatedQuestions(questions, previousQuestions, iterationNumber) 
 
   questions.forEach((question) => {
     const normalizedQuestion = normalizeQuestionText(question)
+    const isRepeatedQuestion = previousQuestions.some((previousQuestion) =>
+      isSimilarQuestion(question, previousQuestion),
+    )
 
-    if (normalizedQuestion && !seenQuestions.has(normalizedQuestion)) {
+    if (
+      normalizedQuestion &&
+      !seenQuestions.has(normalizedQuestion) &&
+      !isRepeatedQuestion
+    ) {
       seenQuestions.add(normalizedQuestion)
       uniqueQuestions.push(question)
     }
@@ -216,10 +248,10 @@ function App() {
           : 'Next'
         : chooseStep === 'feedback'
           ? isTestingModel
-            ? feedbackIterations.length >= maxFeedbackIterations
+            ? currentFeedbackIndex + 1 >= maxFeedbackIterations
               ? 'Generating report...'
               : 'Generating questions...'
-            : feedbackIterations.length >= maxFeedbackIterations
+            : currentFeedbackIndex + 1 >= maxFeedbackIterations
               ? 'Submit'
               : 'Next'
           : 'Done'
@@ -441,18 +473,15 @@ Rules:
     const cacheKey = createQuestionCacheKey(iterations, nextIterationNumber)
 
     if (questionCache[cacheKey]) {
-      setFeedbackIterations((currentIterations) => {
-        const nextIterations = [
-          ...currentIterations,
-          {
-            iteration: nextIterationNumber,
-            questions: questionCache[cacheKey],
-            answers: {},
-          },
-        ]
-        setCurrentFeedbackIndex(nextIterations.length - 1)
-        return nextIterations
-      })
+      setFeedbackIterations([
+        ...iterations,
+        {
+          iteration: nextIterationNumber,
+          questions: questionCache[cacheKey],
+          answers: {},
+        },
+      ])
+      setCurrentFeedbackIndex(iterations.length)
       setChooseStep('feedback')
       setIsTestingModel(false)
       return
@@ -533,29 +562,20 @@ Rules:
 
   async function handleFeedbackNext(event) {
     event.preventDefault()
-    const formData = new FormData(event.currentTarget)
-    const currentIterationIndex = feedbackIterations.length - 1
-    const updatedIterations = feedbackIterations.map((iteration, iterationIndex) =>
-      iterationIndex === currentIterationIndex
-        ? {
-            ...iteration,
-            answers: iteration.questions.reduce(
-              (answers, _question, questionIndex) => ({
-                ...answers,
-                [questionIndex]:
-                  formData.get(`feedback-${iterationIndex}-${questionIndex}`) ||
-                  iteration.answers[questionIndex] ||
-                  '',
-              }),
-              {},
-            ),
-          }
-        : iteration,
+    const updatedIterations = snapshotFeedbackFromForm(
+      event.currentTarget,
+      feedbackIterations,
+      currentFeedbackIndex,
     )
 
     setFeedbackIterations(updatedIterations)
 
-    if (updatedIterations.length >= maxFeedbackIterations) {
+    if (currentFeedbackIndex < updatedIterations.length - 1) {
+      setCurrentFeedbackIndex((currentIndex) => currentIndex + 1)
+      return
+    }
+
+    if (currentFeedbackIndex + 1 >= maxFeedbackIterations) {
       await generateFinalReport(updatedIterations)
       return
     }
@@ -565,7 +585,46 @@ Rules:
 
   async function handleDetailsNext(event) {
     event.preventDefault()
+
+    if (feedbackIterations.length > 0) {
+      setChooseStep('feedback')
+      setCurrentFeedbackIndex(0)
+      return
+    }
+
     await generateFeedbackQuestions()
+  }
+
+  async function handleGenerateClick(event) {
+    const formElement = event.currentTarget.form
+    const iterations =
+      chooseStep === 'feedback'
+        ? snapshotFeedbackFromForm(
+            formElement,
+            feedbackIterations,
+            currentFeedbackIndex,
+          )
+        : feedbackIterations
+
+    if (chooseStep === 'feedback') {
+      setFeedbackIterations(iterations)
+    }
+
+    await generateFinalReport(iterations)
+  }
+
+  function goToPreviousChooseStep() {
+    if (chooseStep === 'details') {
+      setChooseStep('tool')
+      return
+    }
+
+    if (chooseStep === 'feedback' && currentFeedbackIndex > 0) {
+      setCurrentFeedbackIndex((currentIndex) => currentIndex - 1)
+      return
+    }
+
+    setChooseStep('details')
   }
 
 
@@ -828,10 +887,10 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
                     <label key={`${currentFeedbackIteration.iteration}-${question}`}>
                       {question}
                       <textarea
-                        name={`feedback-${feedbackIterations.length - 1}-${questionIndex}`}
+                        name={`feedback-${currentFeedbackIndex}-${questionIndex}`}
                         onChange={(event) =>
                           updateFeedbackAnswer(
-                            feedbackIterations.length - 1,
+                            currentFeedbackIndex,
                             questionIndex,
                             event.target.value,
                           )
@@ -847,51 +906,44 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
 
               {chooseStep !== 'report' && (
                 <div className="form-actions">
-                  <button
-                    className="primary-button"
-                    disabled={isTestingModel}
-                    type="submit"
-                  >
-                    {primaryChooseAction}
-                  </button>
-                  {chooseStep !== 'report' && (
+                  <div className="form-actions-left">
                     <button
                       className="secondary-button"
                       type="button"
                       disabled={isTestingModel}
-                      onClick={generateFinalReport}
+                      onClick={resetWorkflow}
+                    >
+                      Back
+                    </button>
+                    {(chooseStep === 'details' || chooseStep === 'feedback') && (
+                      <button
+                        className="secondary-button"
+                        type="button"
+                        disabled={isTestingModel}
+                        onClick={goToPreviousChooseStep}
+                      >
+                        Previous
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="form-actions-right">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      disabled={isTestingModel}
+                      onClick={handleGenerateClick}
                     >
                       {isTestingModel ? 'Generating...' : 'Generate'}
                     </button>
-                  )}
-                  {chooseStep === 'details' && (
                     <button
-                      className="secondary-button"
-                      type="button"
+                      className="primary-button"
                       disabled={isTestingModel}
-                      onClick={() => setChooseStep('tool')}
+                      type="submit"
                     >
-                      Previous
+                      {primaryChooseAction}
                     </button>
-                  )}
-                  {chooseStep === 'feedback' && (
-                    <button
-                      className="secondary-button"
-                      type="button"
-                      disabled={isTestingModel}
-                      onClick={() => setChooseStep('details')}
-                    >
-                      Previous
-                    </button>
-                  )}
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    disabled={isTestingModel}
-                    onClick={resetWorkflow}
-                  >
-                    Back
-                  </button>
+                  </div>
                 </div>
               )}
 

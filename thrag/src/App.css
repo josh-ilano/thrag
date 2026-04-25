@@ -232,6 +232,14 @@ textarea:focus {
 .form-actions {
   display: flex;
   flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.form-actions-left,
+.form-actions-right {
+  display: flex;
+  flex-wrap: wrap;
   gap: 12px;
 }
 
@@ -301,8 +309,15 @@ textarea:focus {
     flex-direction: column;
   }
 
+  .form-actions-left,
+  .form-actions-right {
+    flex-direction: column;
+  }
+
   .workspace-header .secondary-button,
-  .form-actions button {
+  .form-actions button,
+  .form-actions-left button,
+  .form-actions-right button {
     width: 100%;
   }
 

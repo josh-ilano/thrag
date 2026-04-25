@@ -262,10 +262,52 @@ textarea:focus {
 }
 
 .request-preview h3,
-.model-response h3 {
+.model-response h3,
+.model-response h4 {
   margin: 0 0 14px;
   color: var(--text-h);
+}
+
+.model-response h3 {
   font-size: 18px;
+}
+
+.model-response h4 {
+  margin-bottom: 10px;
+  font-size: 16px;
+}
+
+.appendix-sections {
+  display: grid;
+  gap: 14px;
+}
+
+.appendix-section {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  background: var(--input-bg);
+}
+
+.appendix-query {
+  margin-bottom: 0;
+}
+
+.appendix-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.appendix-pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 6px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  white-space: pre-wrap;
+  overflow-x: auto;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
 }
 
 .model-response p {

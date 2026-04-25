@@ -37,6 +37,38 @@ const maxFeedbackIterations = 6
 const vllmModel =
   import.meta.env.VITE_VLLM_MODEL || 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
 
+const allowedRecommendationModels = [
+  'GPT-4o',
+  'GPT-4.1',
+  'GPT-4.1 mini',
+  'o4-mini',
+  'Claude 3.5 Sonnet',
+  'Claude 3.7 Sonnet',
+  'Claude 3.5 Haiku',
+  'Gemini 1.5 Pro',
+  'Gemini 1.5 Flash',
+  'Gemini 2.0 Flash',
+  'Llama 3.1 8B Instruct',
+  'Llama 3.1 70B Instruct',
+  'Llama 3.1 405B Instruct',
+  'Mistral Large',
+  'Mixtral 8x22B Instruct',
+  'DeepSeek-V3',
+  'DeepSeek-R1',
+  'Qwen2.5 72B Instruct',
+  'Command R+',
+  'Cohere Command R',
+]
+
+const ragSecurityScriptPath = '/Users/joshilano/Downloads/rag_security_assessment.py'
+
+const ragSecurityScriptSummary = `Local MVP: Modular RAG + simulated garak hybrid security assessment.
+- Builds a local risk dataset and retrieves relevant risks with sentence-transformers/FAISS or TF-IDF fallback.
+- Loads simulated or JSON-based garak vulnerability results.
+- Computes risk score (1-5) and confidence score (0-100).
+- Builds a structured security prompt and generates a report through vLLM TinyLlama.
+- Saves report output to disk for traceability.`
+
 function createTailoredDetailHints() {
   return {
     riskAssessment:
@@ -95,6 +127,90 @@ function normalizeDetailHints(reply) {
       parsedHints.data_privacy ||
       tailoredHints.dataRequirements,
   }
+}
+
+function parseRagAssessmentOutput(rawOutput) {
+  const raw = String(rawOutput || '').trim()
+  if (!raw) {
+    return null
+  }
+
+  const lines = raw.split('\n')
+  const tool = lines.find((line) => line.startsWith('[DEBUG] tool='))?.replace('[DEBUG] tool=', '').trim() || ''
+  const retrievalQuery =
+    lines
+      .find((line) => line.startsWith('[DEBUG] retrieval_query='))
+      ?.replace('[DEBUG] retrieval_query=', '')
+      .trim() || ''
+  const riskScore =
+    lines
+      .find((line) => line.startsWith('[DEBUG] risk_score_1to5='))
+      ?.replace('[DEBUG] risk_score_1to5=', '')
+      .trim() || ''
+  const confidenceScore =
+    lines
+      .find((line) => line.startsWith('[DEBUG] confidence_0to100='))
+      ?.replace('[DEBUG] confidence_0to100=', '')
+      .trim() || ''
+
+  const retrievedRisks = lines
+    .filter((line) => line.trim().startsWith('- sim='))
+    .map((line) => line.trim())
+
+  const garakStart = lines.findIndex(
+    (line) => line.trim() === '[DEBUG] garak_results:',
+  )
+  const riskScoreIndex = lines.findIndex((line) =>
+    line.startsWith('[DEBUG] risk_score_1to5='),
+  )
+  const garakJson =
+    garakStart !== -1 && riskScoreIndex !== -1 && riskScoreIndex > garakStart
+      ? lines.slice(garakStart + 1, riskScoreIndex).join('\n').trim()
+      : ''
+
+  const divider = '================================================================================'
+  const dividerIndexes = lines
+    .map((line, index) => (line.trim() === divider ? index : -1))
+    .filter((index) => index !== -1)
+  const reportStartIndex =
+    dividerIndexes.length >= 2 ? dividerIndexes[1] + 1 : lines.length
+  const narrativeReport = lines.slice(reportStartIndex).join('\n').trim()
+
+  return {
+    tool,
+    retrievalQuery,
+    riskScore,
+    confidenceScore,
+    retrievedRisks,
+    garakJson,
+    narrativeReport,
+    raw,
+  }
+}
+
+function parseAndValidateModelRecommendations(reply) {
+  const parsed = extractJsonObject(reply)
+  const recommendations = parsed?.recommendations
+
+  if (!Array.isArray(recommendations) || recommendations.length !== 5) {
+    return null
+  }
+
+  const allowedSet = new Set(allowedRecommendationModels)
+  const allAllowed = recommendations.every((recommendation) =>
+    allowedSet.has(String(recommendation?.modelName || '').trim()),
+  )
+
+  if (!allAllowed) {
+    return null
+  }
+
+  const bestOverallModel = String(parsed?.bestOverallModel || '').trim()
+  if (!bestOverallModel || !allowedSet.has(bestOverallModel)) {
+    return null
+  }
+
+  return parsed
 }
 
 function normalizeFeedbackQuestions(reply, iterationNumber) {
@@ -214,12 +330,19 @@ function App() {
   const [isTestingModel, setIsTestingModel] = useState(false)
   const [vetSoftwareForm, setVetSoftwareForm] = useState(emptyVetSoftwareForm)
   const [vetSoftwareReport, setVetSoftwareReport] = useState('')
+  const [vetAppendixOutput, setVetAppendixOutput] = useState('')
+  const [vetAppendixMeta, setVetAppendixMeta] = useState(null)
   const [isGeneratingVetReport, setIsGeneratingVetReport] = useState(false)
   const [session, setSession] = useState(null)
   const [isLoadingSession, setIsLoadingSession] = useState(Boolean(supabase))
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
+
+  const parsedVetAppendix = useMemo(
+    () => parseRagAssessmentOutput(vetAppendixOutput),
+    [vetAppendixOutput],
+  )
 
   const isRegistering = authMode === 'register'
 
@@ -318,6 +441,8 @@ function App() {
     setQuestionCache({})
     setVetSoftwareForm(emptyVetSoftwareForm)
     setVetSoftwareReport('')
+    setVetAppendixOutput('')
+    setVetAppendixMeta(null)
   }
 
   function updateChooseSoftwareForm(event) {
@@ -364,16 +489,41 @@ function App() {
     return reply
   }
 
+  async function requestRagSecurityAppendix() {
+    const response = await fetch('/api/rag-security-assessment', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        modelName: vetSoftwareForm.modelName,
+        intendedUse: vetSoftwareForm.intendedUse,
+        deploymentContext: vetSoftwareForm.deploymentContext,
+      }),
+    })
+
+    if (!response.ok) {
+      throw new Error(
+        `RAG security assessment request failed with status ${response.status}`,
+      )
+    }
+
+    return response.json()
+  }
+
   async function handleVetSoftwareSubmit(event) {
     event.preventDefault()
     setError('')
     setNotice('')
     setVetSoftwareReport('')
+    setVetAppendixOutput('')
+    setVetAppendixMeta(null)
     setIsGeneratingVetReport(true)
 
     const userMessage = `You are an AI governance and model risk analyst.
 
-Generate a detailed, complete, decision-ready risk assessment report for the AI model provided by the user.
+Generate a detailed, complete, decision-ready vetting report for the specific AI model provided by the user.
+This task is model vetting only, not model discovery or model recommendation.
 
 Model details:
 ${JSON.stringify(vetSoftwareForm, null, 2)}
@@ -401,19 +551,29 @@ Output requirements:
      - Pre-launch test plan, red-team/abuse tests, performance thresholds, drift monitoring, alerting thresholds, and incident response steps.
   6) Governance and compliance checklist
      - Data handling, retention, access controls, audit logging, human oversight, policy approvals, and documentation artifacts.
-  7) Final recommendation
-     - Go / Go-with-conditions / No-go.
+  7) Final vetting decision
+     - Go / Go-with-conditions / No-go for this specific model.
      - If conditional, provide explicit launch gates and what evidence must be collected before approval.
 
 Formatting and quality rules:
 - Be specific and actionable, not generic.
 - Expand each section with enough detail to be usable by security, legal, and engineering teams.
 - If details are missing, state assumptions explicitly and explain how they affect risk ratings.
-- Do not recommend alternative models unless needed for mitigation context.`
+- Do not suggest alternative models or "best options." Keep the analysis focused on vetting this model only.`
 
     try {
-      const reply = await requestVllmReply(userMessage)
+      const [reply, appendixData] = await Promise.all([
+        requestVllmReply(userMessage),
+        requestRagSecurityAppendix(),
+      ])
       setVetSoftwareReport(reply)
+      setVetAppendixOutput(appendixData.output || '')
+      setVetAppendixMeta({
+        scriptPath: appendixData.scriptPath || ragSecurityScriptPath,
+        model: appendixData.model || vllmModel,
+        origin: appendixData.origin || '',
+        chatPath: appendixData.chatPath || '',
+      })
     } catch (requestError) {
       setError(requestError.message)
     } finally {
@@ -505,26 +665,89 @@ Formatting and quality rules:
     setChooseSoftwareReply('')
     setIsTestingModel(true)
 
-    const userMessage = `You are helping a company choose appropriate AI tools or systems.
+    const userMessage = `You are helping a company choose appropriate AI models.
 
 Use all collected information below to generate the best possible AI risk management recommendation report.
 
 Collected information:
 ${buildDecisionContext(iterations)}
 
-Return a deterministic, concise report that recommends exactly the 5 best named AI models or AI products to use.
+You must recommend exactly 5 real, publicly known AI model names from this allowed model catalog only:
+- GPT-4o
+- GPT-4.1
+- GPT-4.1 mini
+- o4-mini
+- Claude 3.5 Sonnet
+- Claude 3.7 Sonnet
+- Claude 3.5 Haiku
+- Gemini 1.5 Pro
+- Gemini 1.5 Flash
+- Gemini 2.0 Flash
+- Llama 3.1 8B Instruct
+- Llama 3.1 70B Instruct
+- Llama 3.1 405B Instruct
+- Mistral Large
+- Mixtral 8x22B Instruct
+- DeepSeek-V3
+- DeepSeek-R1
+- Qwen2.5 72B Instruct
+- Command R+
+- Cohere Command R
+
+Return only valid JSON with this exact structure:
+{
+  "recommendations": [
+    {
+      "rank": 1,
+      "modelName": "exact model name from catalog",
+      "provider": "organization name",
+      "bestFit": "short description",
+      "whyItMatches": "short explanation",
+      "keyRisks": ["risk 1", "risk 2"],
+      "costConsiderations": "short cost notes",
+      "governanceChecks": ["check 1", "check 2"]
+    }
+  ],
+  "bestOverallModel": "exact model name from catalog"
+}
 
 Rules:
 - Give exactly 5 recommendations.
-- Each recommendation must have a specific name, such as a model name or product name.
-- Do not recommend vague categories like "chatbot platform", "image generator", or "LLM API".
+- Every recommendation must be an exact model name from the allowed catalog.
+- Do not invent model names.
+- Do not recommend tools, platforms, categories, or model families without a specific model name.
 - Rank the recommendations from 1 to 5.
-- For each recommendation include: name, best fit, why it matches the user's needs, key risks to evaluate, cost considerations, and data/privacy/governance checks.
-- End with one final best overall recommendation.`
+- Include concise, actionable content for each required field.
+- Set "bestOverallModel" to one of the 5 recommended models.`
 
     try {
       const reply = await requestVllmReply(userMessage)
-      setChooseSoftwareReply(reply)
+      const validated = parseAndValidateModelRecommendations(reply)
+
+      if (validated) {
+        setChooseSoftwareReply(JSON.stringify(validated, null, 2))
+        setChooseStep('report')
+        return
+      }
+
+      const correctionPrompt = `Your previous response did not follow requirements.
+Return only valid JSON that matches the required structure, with exactly 5 recommendations.
+Each recommendation.modelName must be one of these exact values:
+${JSON.stringify(allowedRecommendationModels, null, 2)}
+
+Previous response:
+${reply}`
+
+      const correctedReply = await requestVllmReply(correctionPrompt)
+      const correctedValidated = parseAndValidateModelRecommendations(correctedReply)
+
+      if (!correctedValidated) {
+        throw new Error(
+          'Could not generate valid model recommendations with exact known model names.',
+        )
+      }
+
+      setChooseSoftwareReply(JSON.stringify(correctedValidated, null, 2))
       setChooseStep('report')
     } catch (requestError) {
       setError(requestError.message)
@@ -714,6 +937,8 @@ Rules:
     setFeedbackIterations([])
     setVetSoftwareForm(emptyVetSoftwareForm)
     setVetSoftwareReport('')
+    setVetAppendixOutput('')
+    setVetAppendixMeta(null)
   }
 
   async function goToChooseDetails(event) {
@@ -1090,10 +1315,11 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
               onSubmit={handleVetSoftwareSubmit}
             >
               <div>
-                <p className="eyebrow">Vetting an AI tool</p>
-                <h2>Generate an AI model risk assessment</h2>
+                <p className="eyebrow">Vetting a specific AI model</p>
+                <h2>Generate an AI model vetting report</h2>
                 <p>
-                  Enter the model and context, then generate a risk-focused report
+                  Enter the model and context, then generate a risk-focused vetting
+                  report for that model only
                   from vLLM.
                 </p>
               </div>
@@ -1149,7 +1375,9 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
                     disabled={isGeneratingVetReport}
                     type="submit"
                   >
-                    {isGeneratingVetReport ? 'Generating report...' : 'Generate risk report'}
+                    {isGeneratingVetReport
+                      ? 'Generating vetting report...'
+                      : 'Generate vetting report'}
                   </button>
                 </div>
               </div>
@@ -1158,6 +1386,72 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
                 <div className="model-response" aria-live="polite">
                   <h3>vLLM risk assessment report</h3>
                   <p>{vetSoftwareReport}</p>
+                </div>
+              )}
+
+              {vetAppendixOutput && (
+                <div className="model-response" aria-live="polite">
+                  <h3>RAG security assessment appendix</h3>
+                  <p>
+                    Script: <code>{vetAppendixMeta?.scriptPath || ragSecurityScriptPath}</code>
+                  </p>
+                  <p>
+                    Runtime: <code>{vetAppendixMeta?.model || vllmModel}</code> via{' '}
+                    <code>{vetAppendixMeta?.origin || 'http://localhost:8000'}</code>
+                    {' '}
+                    <code>{vetAppendixMeta?.chatPath || '/v1/chat/completions'}</code>
+                  </p>
+                  <p>{ragSecurityScriptSummary}</p>
+                  {parsedVetAppendix ? (
+                    <div className="appendix-sections">
+                      <div className="appendix-section">
+                        <h4>Assessment snapshot</h4>
+                        <p>
+                          Tool under test: <strong>{parsedVetAppendix.tool || 'N/A'}</strong>
+                        </p>
+                        <p>
+                          Risk score (1-5): <strong>{parsedVetAppendix.riskScore || 'N/A'}</strong>{' '}
+                          | Confidence (0-100):{' '}
+                          <strong>{parsedVetAppendix.confidenceScore || 'N/A'}</strong>
+                        </p>
+                        {parsedVetAppendix.retrievalQuery && (
+                          <p className="appendix-query">
+                            <strong>Retrieval query:</strong>{' '}
+                            {parsedVetAppendix.retrievalQuery}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="appendix-section">
+                        <h4>Retrieved risks</h4>
+                        {parsedVetAppendix.retrievedRisks.length > 0 ? (
+                          <ul className="appendix-list">
+                            {parsedVetAppendix.retrievedRisks.map((riskLine) => (
+                              <li key={riskLine}>{riskLine.replace(/^- /, '')}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p>No retrieved risks were captured.</p>
+                        )}
+                      </div>
+
+                      <div className="appendix-section">
+                        <h4>Observed vulnerabilities input (garak)</h4>
+                        <pre className="appendix-pre">
+                          {parsedVetAppendix.garakJson || '{}'}
+                        </pre>
+                      </div>
+
+                      <div className="appendix-section">
+                        <h4>Generated assessment narrative</h4>
+                        <pre className="appendix-pre">
+                          {parsedVetAppendix.narrativeReport || parsedVetAppendix.raw}
+                        </pre>
+                      </div>
+                    </div>
+                  ) : (
+                    <pre className="appendix-pre">{vetAppendixOutput}</pre>
+                  )}
                 </div>
               )}
             </form>

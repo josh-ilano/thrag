@@ -120,6 +120,45 @@ function normalizeFeedbackQuestions(reply, iterationNumber) {
   return fallbackQuestions.slice(0, Math.min(6, iterationNumber + 2))
 }
 
+function normalizeQuestionText(question) {
+  return question
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function getPreviousQuestions(iterations) {
+  return iterations.flatMap((iteration) => iteration.questions)
+}
+
+function removeRepeatedQuestions(questions, previousQuestions, iterationNumber) {
+  const seenQuestions = new Set(previousQuestions.map(normalizeQuestionText))
+  const uniqueQuestions = []
+
+  questions.forEach((question) => {
+    const normalizedQuestion = normalizeQuestionText(question)
+
+    if (normalizedQuestion && !seenQuestions.has(normalizedQuestion)) {
+      seenQuestions.add(normalizedQuestion)
+      uniqueQuestions.push(question)
+    }
+  })
+
+  const fallbackQuestions = normalizeFeedbackQuestions('', iterationNumber)
+
+  fallbackQuestions.forEach((question) => {
+    const normalizedQuestion = normalizeQuestionText(question)
+
+    if (uniqueQuestions.length < 3 && !seenQuestions.has(normalizedQuestion)) {
+      seenQuestions.add(normalizedQuestion)
+      uniqueQuestions.push(question)
+    }
+  })
+
+  return uniqueQuestions.slice(0, 6)
+}
+
 function App() {
   const [authMode, setAuthMode] = useState('sign-in')
   const [form, setForm] = useState(emptyForm)
@@ -132,6 +171,8 @@ function App() {
   const [chooseStep, setChooseStep] = useState('tool')
   const [detailHints, setDetailHints] = useState(defaultDetailHints)
   const [feedbackIterations, setFeedbackIterations] = useState([])
+  const [currentFeedbackIndex, setCurrentFeedbackIndex] = useState(0)
+  const [questionCache, setQuestionCache] = useState({})
   const [isTestingModel, setIsTestingModel] = useState(false)
   const [session, setSession] = useState(null)
   const [isLoadingSession, setIsLoadingSession] = useState(Boolean(supabase))
@@ -163,8 +204,7 @@ function App() {
     [isRegistering],
   )
 
-  const currentFeedbackIteration =
-    feedbackIterations[feedbackIterations.length - 1]
+  const currentFeedbackIteration = feedbackIterations[currentFeedbackIndex]
   const primaryChooseAction =
     chooseStep === 'tool'
       ? isTestingModel
@@ -233,6 +273,8 @@ function App() {
     setChooseStep('tool')
     setDetailHints(defaultDetailHints)
     setFeedbackIterations([])
+    setCurrentFeedbackIndex(0)
+    setQuestionCache({})
   }
 
   function updateChooseSoftwareForm(event) {
@@ -252,6 +294,8 @@ function App() {
       body: JSON.stringify({
         model: vllmModel,
         messages: [{ role: 'user', content: userMessage }],
+        temperature: 0,
+        top_p: 1,
       }),
     })
 
@@ -285,7 +329,7 @@ function App() {
     )
   }
 
-  function buildDecisionContext() {
+  function buildDecisionContext(iterations = feedbackIterations) {
     return JSON.stringify(
       {
         initialRequest: chooseSoftwareForm.desiredTool,
@@ -295,7 +339,7 @@ function App() {
           costs: chooseSoftwareForm.costs,
           dataRequirements: chooseSoftwareForm.dataRequirements,
         },
-        followUps: feedbackIterations.map((iteration) => ({
+        followUps: iterations.map((iteration) => ({
           iteration: iteration.iteration,
           questions: iteration.questions.map((question, questionIndex) => ({
             question,
@@ -308,12 +352,47 @@ function App() {
     )
   }
 
-  async function generateFinalReport() {
+  function createQuestionCacheKey(iterations, iterationNumber) {
+    return JSON.stringify({
+      iterationNumber,
+      context: buildDecisionContext(iterations),
+    })
+  }
+
+  function snapshotFeedbackFromForm(formElement, iterations, iterationIndex) {
+    if (!formElement || iterationIndex < 0) {
+      return iterations
+    }
+
+    const formData = new FormData(formElement)
+
+    return iterations.map((iteration, currentIterationIndex) =>
+      currentIterationIndex === iterationIndex
+        ? {
+            ...iteration,
+            answers: iteration.questions.reduce(
+              (answers, _question, questionIndex) => ({
+                ...answers,
+                [questionIndex]:
+                  formData.get(
+                    `feedback-${currentIterationIndex}-${questionIndex}`,
+                  ) ||
+                  iteration.answers[questionIndex] ||
+                  '',
+              }),
+              {},
+            ),
+          }
+        : iteration,
+    )
+  }
+
+  async function generateFinalReport(iterations = feedbackIterations) {
     setError('')
     setNotice('')
     setChooseSoftwareRequest({
       ...chooseSoftwareForm,
-      feedbackIterations,
+      feedbackIterations: iterations,
     })
     setChooseSoftwareReply('')
     setIsTestingModel(true)
@@ -323,15 +402,17 @@ function App() {
 Use all collected information below to generate the best possible AI risk management recommendation report.
 
 Collected information:
-${buildDecisionContext()}
+${buildDecisionContext(iterations)}
 
-Return a concise report with:
-1. Recommended AI tool categories or products
-2. Why they fit the user's needs
-3. Key risks to evaluate
-4. Cost considerations
-5. Data, privacy, and governance checks
-6. A final recommendation.`
+Return a deterministic, concise report that recommends exactly the 5 best named AI models or AI products to use.
+
+Rules:
+- Give exactly 5 recommendations.
+- Each recommendation must have a specific name, such as a model name or product name.
+- Do not recommend vague categories like "chatbot platform", "image generator", or "LLM API".
+- Rank the recommendations from 1 to 5.
+- For each recommendation include: name, best fit, why it matches the user's needs, key risks to evaluate, cost considerations, and data/privacy/governance checks.
+- End with one final best overall recommendation.`
 
     try {
       const reply = await requestVllmReply(userMessage)
@@ -349,19 +430,43 @@ Return a concise report with:
     await generateFinalReport()
   }
 
-  async function generateFeedbackQuestions() {
+  async function generateFeedbackQuestions(iterations = feedbackIterations) {
     setError('')
     setNotice('')
     setChooseSoftwareReply('')
     setIsTestingModel(true)
 
-    const nextIterationNumber = feedbackIterations.length + 1
+    const nextIterationNumber = iterations.length + 1
+    const previousQuestions = getPreviousQuestions(iterations)
+    const cacheKey = createQuestionCacheKey(iterations, nextIterationNumber)
+
+    if (questionCache[cacheKey]) {
+      setFeedbackIterations((currentIterations) => {
+        const nextIterations = [
+          ...currentIterations,
+          {
+            iteration: nextIterationNumber,
+            questions: questionCache[cacheKey],
+            answers: {},
+          },
+        ]
+        setCurrentFeedbackIndex(nextIterations.length - 1)
+        return nextIterations
+      })
+      setChooseStep('feedback')
+      setIsTestingModel(false)
+      return
+    }
+
     const userMessage = `You are narrowing down an AI risk management recommendation.
 
 Generate tailored follow-up questions based on all of the user's responses so far. The questions should help narrow the recommendation and avoid repeating questions already answered.
 
 Collected information:
-${buildDecisionContext()}
+${buildDecisionContext(iterations)}
+
+Previously asked questions:
+${JSON.stringify(previousQuestions, null, 2)}
 
 Return only valid JSON with this shape:
 {
@@ -372,14 +477,20 @@ Return only valid JSON with this shape:
 }
 
 Rules:
-- Generate between 3 and 6 questions.
+- Generate between 3 and 6 new questions.
 - Questions must be specific to the user's needs.
+- Questions must be based on the user's previous answers in the collected information.
+- Do not repeat or rephrase any previous question.
 - Questions should cover missing details, tradeoffs, constraints, risk appetite, deployment context, users, governance, budget, integrations, or data sensitivity.
 - This is iteration ${nextIterationNumber} of ${maxFeedbackIterations}. Later iterations should become more specific.`
 
     try {
       const reply = await requestVllmReply(userMessage)
-      const questions = normalizeFeedbackQuestions(reply, nextIterationNumber)
+      const questions = removeRepeatedQuestions(
+        normalizeFeedbackQuestions(reply, nextIterationNumber),
+        previousQuestions,
+        nextIterationNumber,
+      )
       setFeedbackIterations((currentIterations) => [
         ...currentIterations,
         {
@@ -388,9 +499,18 @@ Rules:
           answers: {},
         },
       ])
+      setCurrentFeedbackIndex(iterations.length)
+      setQuestionCache((currentCache) => ({
+        ...currentCache,
+        [cacheKey]: questions,
+      }))
       setChooseStep('feedback')
     } catch (requestError) {
-      const questions = normalizeFeedbackQuestions('', nextIterationNumber)
+      const questions = removeRepeatedQuestions(
+        normalizeFeedbackQuestions('', nextIterationNumber),
+        previousQuestions,
+        nextIterationNumber,
+      )
       setFeedbackIterations((currentIterations) => [
         ...currentIterations,
         {
@@ -399,6 +519,11 @@ Rules:
           answers: {},
         },
       ])
+      setCurrentFeedbackIndex(iterations.length)
+      setQuestionCache((currentCache) => ({
+        ...currentCache,
+        [cacheKey]: questions,
+      }))
       setChooseStep('feedback')
       setError(`${requestError.message} Using local follow-up questions instead.`)
     } finally {
@@ -408,13 +533,34 @@ Rules:
 
   async function handleFeedbackNext(event) {
     event.preventDefault()
+    const formData = new FormData(event.currentTarget)
+    const currentIterationIndex = feedbackIterations.length - 1
+    const updatedIterations = feedbackIterations.map((iteration, iterationIndex) =>
+      iterationIndex === currentIterationIndex
+        ? {
+            ...iteration,
+            answers: iteration.questions.reduce(
+              (answers, _question, questionIndex) => ({
+                ...answers,
+                [questionIndex]:
+                  formData.get(`feedback-${iterationIndex}-${questionIndex}`) ||
+                  iteration.answers[questionIndex] ||
+                  '',
+              }),
+              {},
+            ),
+          }
+        : iteration,
+    )
 
-    if (feedbackIterations.length >= maxFeedbackIterations) {
-      await generateFinalReport()
+    setFeedbackIterations(updatedIterations)
+
+    if (updatedIterations.length >= maxFeedbackIterations) {
+      await generateFinalReport(updatedIterations)
       return
     }
 
-    await generateFeedbackQuestions()
+    await generateFeedbackQuestions(updatedIterations)
   }
 
   async function handleDetailsNext(event) {
@@ -682,6 +828,7 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
                     <label key={`${currentFeedbackIteration.iteration}-${question}`}>
                       {question}
                       <textarea
+                        name={`feedback-${feedbackIterations.length - 1}-${questionIndex}`}
                         onChange={(event) =>
                           updateFeedbackAnswer(
                             feedbackIterations.length - 1,

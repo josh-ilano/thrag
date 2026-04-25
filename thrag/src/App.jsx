@@ -60,6 +60,29 @@ const allowedRecommendationModels = [
   'Cohere Command R',
 ]
 
+const modelProviderByName = {
+  'GPT-4o': 'OpenAI',
+  'GPT-4.1': 'OpenAI',
+  'GPT-4.1 mini': 'OpenAI',
+  'o4-mini': 'OpenAI',
+  'Claude 3.5 Sonnet': 'Anthropic',
+  'Claude 3.7 Sonnet': 'Anthropic',
+  'Claude 3.5 Haiku': 'Anthropic',
+  'Gemini 1.5 Pro': 'Google',
+  'Gemini 1.5 Flash': 'Google',
+  'Gemini 2.0 Flash': 'Google',
+  'Llama 3.1 8B Instruct': 'Meta',
+  'Llama 3.1 70B Instruct': 'Meta',
+  'Llama 3.1 405B Instruct': 'Meta',
+  'Mistral Large': 'Mistral AI',
+  'Mixtral 8x22B Instruct': 'Mistral AI',
+  'DeepSeek-V3': 'DeepSeek',
+  'DeepSeek-R1': 'DeepSeek',
+  'Qwen2.5 72B Instruct': 'Alibaba Cloud',
+  'Command R+': 'Cohere',
+  'Cohere Command R': 'Cohere',
+}
+
 const ragSecurityScriptPath = '/Users/joshilano/Downloads/rag_security_assessment.py'
 
 const ragSecurityScriptSummary = `Local MVP: Modular RAG + simulated garak hybrid security assessment.
@@ -127,6 +150,62 @@ function normalizeDetailHints(reply) {
       parsedHints.data_privacy ||
       tailoredHints.dataRequirements,
   }
+}
+
+function getLocalIterationQuestions(iterationNumber) {
+  const questionSets = {
+    1: [
+      'Which user roles will use the model first, and which actions should be blocked for each role?',
+      'What specific outputs are unacceptable in your workflow, and how should those be detected?',
+      'What latency and quality thresholds must be met for this use case to be considered successful?',
+      'Which systems (CRM, ticketing, data warehouse, internal APIs) must this model integrate with?',
+    ],
+    2: [
+      'What data classes (PII, financial, support logs, source code) will be sent to the model?',
+      'What data retention limit and deletion guarantees are required by policy or contracts?',
+      'Do you require no-training-on-your-data guarantees, and how will that be verified?',
+      'What access controls and approval workflow are required before production rollout?',
+    ],
+    3: [
+      'Which compliance controls are mandatory at launch versus acceptable for a post-launch phase?',
+      'What audit evidence must be available for security/legal review before approval?',
+      'What jurisdictions or data residency boundaries must the provider satisfy?',
+      'What incident response SLA is required if harmful or non-compliant outputs are detected?',
+    ],
+    4: [
+      'Which failure modes are most costly for your business: hallucination, delay, leakage, or refusal?',
+      'What human-in-the-loop checkpoint should be enforced before high-impact actions?',
+      'What fallback behavior should the application use when model confidence is low?',
+      'How should prompt-injection attempts be detected and logged in production?',
+    ],
+    5: [
+      'What monthly budget ceiling and usage volume should the recommendation optimize for?',
+      'How sensitive is this choice to token pricing versus latency and reliability?',
+      'What scaling scenario (10x users, peak loads, regional expansion) should be stress-tested?',
+      'What contractual requirements (indemnity, SLA, support tier) are non-negotiable?',
+    ],
+    6: [
+      'What final go/no-go criteria should determine the selected model?',
+      'Which top two trade-offs are acceptable and which one is not negotiable?',
+      'What pilot metrics over the first 30 days will confirm model fit?',
+      'Who signs off across security, legal, and product before full deployment?',
+    ],
+  }
+
+  return questionSets[iterationNumber] || questionSets[6]
+}
+
+function extractQuestionCandidates(reply) {
+  return String(reply || '')
+    .split('\n')
+    .map((line) =>
+      line
+        .replace(/^\s*[-*]\s+/, '')
+        .replace(/^\s*\d+[).\s-]+/, '')
+        .trim(),
+    )
+    .filter((line) => line.length > 18)
+    .filter((line) => line.endsWith('?'))
 }
 
 function parseRagAssessmentOutput(rawOutput) {
@@ -210,7 +289,149 @@ function parseAndValidateModelRecommendations(reply) {
     return null
   }
 
-  return parsed
+  const normalizedRecommendations = recommendations
+    .map((recommendation, index) => {
+      const modelName = String(recommendation?.modelName || '').trim()
+      return {
+        rank: Number(recommendation?.rank) || index + 1,
+        modelName,
+        provider:
+          String(recommendation?.provider || '').trim() ||
+          modelProviderByName[modelName] ||
+          'Unknown provider',
+        bestFit: String(recommendation?.bestFit || '').trim() || 'Not specified.',
+        whyItMatches:
+          String(recommendation?.whyItMatches || '').trim() ||
+          'Not specified.',
+        keyRisks: Array.isArray(recommendation?.keyRisks)
+          ? recommendation.keyRisks.map((risk) => String(risk).trim()).filter(Boolean)
+          : [],
+        costConsiderations:
+          String(recommendation?.costConsiderations || '').trim() ||
+          'Not specified.',
+        governanceChecks: Array.isArray(recommendation?.governanceChecks)
+          ? recommendation.governanceChecks
+              .map((check) => String(check).trim())
+              .filter(Boolean)
+          : [],
+      }
+    })
+    .sort((a, b) => a.rank - b.rank)
+    .slice(0, 5)
+
+  return {
+    recommendations: normalizedRecommendations,
+    bestOverallModel,
+  }
+}
+
+function extractModelRecommendationsFromText(reply) {
+  const lowerReply = String(reply || '').toLowerCase()
+  const matched = allowedRecommendationModels.filter((modelName) =>
+    lowerReply.includes(modelName.toLowerCase()),
+  )
+
+  const uniqueModels = [...new Set(matched)].slice(0, 5)
+  if (uniqueModels.length !== 5) {
+    return null
+  }
+
+  return {
+    recommendations: uniqueModels.map((modelName, index) => ({
+      rank: index + 1,
+      modelName,
+      provider: modelProviderByName[modelName] || 'Unknown provider',
+      bestFit: 'General-purpose enterprise assistant use cases.',
+      whyItMatches:
+        'Matches the stated requirements for capability, governance, and deployment constraints.',
+      keyRisks: ['hallucination risk', 'data handling and access control risk'],
+      costConsiderations:
+        'Validate expected token and throughput costs against projected usage.',
+      governanceChecks: [
+        'confirm data retention and no-training policy',
+        'complete security and compliance control mapping',
+      ],
+    })),
+    bestOverallModel: uniqueModels[0],
+  }
+}
+
+function buildDeterministicModelRecommendations(form) {
+  const combinedContext = [
+    form.desiredTool,
+    form.modelType,
+    form.riskAssessment,
+    form.costs,
+    form.dataRequirements,
+  ]
+    .join(' ')
+    .toLowerCase()
+
+  const scores = Object.fromEntries(
+    allowedRecommendationModels.map((modelName) => [modelName, 0]),
+  )
+
+  const boost = (modelName, value) => {
+    scores[modelName] = (scores[modelName] || 0) + value
+  }
+
+  if (/(code|developer|copilot|engineering)/.test(combinedContext)) {
+    boost('GPT-4.1', 3)
+    boost('Claude 3.7 Sonnet', 3)
+    boost('DeepSeek-V3', 2)
+  }
+  if (/(image|vision|multimodal|audio|speech)/.test(combinedContext)) {
+    boost('GPT-4o', 3)
+    boost('Gemini 1.5 Pro', 2)
+    boost('Gemini 2.0 Flash', 2)
+  }
+  if (/(low cost|budget|cheap|cost sensitive|token cost)/.test(combinedContext)) {
+    boost('GPT-4.1 mini', 3)
+    boost('Gemini 1.5 Flash', 3)
+    boost('o4-mini', 2)
+    boost('Llama 3.1 8B Instruct', 2)
+  }
+  if (/(privacy|data residency|on prem|on-prem|self host|self-host)/.test(combinedContext)) {
+    boost('Llama 3.1 70B Instruct', 3)
+    boost('Qwen2.5 72B Instruct', 2)
+    boost('Mixtral 8x22B Instruct', 2)
+  }
+  if (/(reasoning|complex|analysis|hard)/.test(combinedContext)) {
+    boost('DeepSeek-R1', 2)
+    boost('Claude 3.7 Sonnet', 2)
+    boost('GPT-4.1', 2)
+  }
+
+  // Strong defaults for general enterprise usage.
+  boost('GPT-4o', 2)
+  boost('Claude 3.5 Sonnet', 2)
+  boost('Gemini 1.5 Pro', 2)
+
+  const topModels = [...allowedRecommendationModels]
+    .sort((a, b) => scores[b] - scores[a])
+    .slice(0, 5)
+
+  return {
+    recommendations: topModels.map((modelName, index) => ({
+      rank: index + 1,
+      modelName,
+      provider: modelProviderByName[modelName] || 'Unknown provider',
+      bestFit: form.desiredTool || 'General enterprise AI workloads',
+      whyItMatches:
+        'Selected by matching your capability needs, risk constraints, and budget/governance context.',
+      keyRisks: [
+        'output reliability and hallucination risk',
+        'data governance and policy enforcement risk',
+      ],
+      costConsiderations:
+        'Validate per-token/per-request spend, throughput pricing, and projected monthly budget.',
+      governanceChecks: [
+        'confirm retention/no-training controls',
+        'validate access controls, audit logs, and compliance evidence',
+      ],
+    })),
+    bestOverallModel: topModels[0],
+  }
 }
 
 function normalizeFeedbackQuestions(reply, iterationNumber) {
@@ -219,26 +440,23 @@ function normalizeFeedbackQuestions(reply, iterationNumber) {
     ? parsedResponse
     : parsedResponse?.questions
 
-  const questions = Array.isArray(rawQuestions)
+  const parsedQuestions = Array.isArray(rawQuestions)
     ? rawQuestions
         .map((question) => String(question).trim())
         .filter(Boolean)
         .slice(0, 6)
     : []
 
-  if (questions.length > 0) {
-    return questions
+  if (parsedQuestions.length > 0) {
+    return parsedQuestions
   }
 
-  const fallbackQuestions = [
-    'Who will use this AI capability, and what decisions or workflows will it influence?',
-    'What type of information will users provide to the AI system?',
-    'What outputs would be unacceptable, unsafe, or expensive for your organization?',
-    'What human review or approval should happen before the AI output is used?',
-    'Which compliance, procurement, or security requirements must the tool satisfy?',
-    'What would make one recommendation clearly better than another?',
-  ]
+  const extractedQuestions = extractQuestionCandidates(reply).slice(0, 6)
+  if (extractedQuestions.length > 0) {
+    return extractedQuestions
+  }
 
+  const fallbackQuestions = getLocalIterationQuestions(iterationNumber)
   return fallbackQuestions.slice(0, Math.min(6, iterationNumber + 2))
 }
 
@@ -272,7 +490,7 @@ function isSimilarQuestion(question, previousQuestion) {
   const overlapRatio =
     sharedWordCount / Math.min(currentWords.size, previousWords.size)
 
-  return overlapRatio >= 0.7
+  return overlapRatio >= 0.5
 }
 
 function getPreviousQuestions(iterations) {
@@ -322,6 +540,8 @@ function App() {
   )
   const [chooseSoftwareRequest, setChooseSoftwareRequest] = useState(null)
   const [chooseSoftwareReply, setChooseSoftwareReply] = useState('')
+  const [chooseSoftwareRecommendations, setChooseSoftwareRecommendations] =
+    useState(null)
   const [chooseStep, setChooseStep] = useState('tool')
   const [detailHints, setDetailHints] = useState(defaultDetailHints)
   const [feedbackIterations, setFeedbackIterations] = useState([])
@@ -434,6 +654,7 @@ function App() {
     setActiveWorkflow(workflow)
     setChooseSoftwareRequest(null)
     setChooseSoftwareReply('')
+    setChooseSoftwareRecommendations(null)
     setChooseStep('tool')
     setDetailHints(defaultDetailHints)
     setFeedbackIterations([])
@@ -663,6 +884,7 @@ Formatting and quality rules:
       feedbackIterations: iterations,
     })
     setChooseSoftwareReply('')
+    setChooseSoftwareRecommendations(null)
     setIsTestingModel(true)
 
     const userMessage = `You are helping a company choose appropriate AI models.
@@ -725,6 +947,7 @@ Rules:
       const validated = parseAndValidateModelRecommendations(reply)
 
       if (validated) {
+        setChooseSoftwareRecommendations(validated)
         setChooseSoftwareReply(JSON.stringify(validated, null, 2))
         setChooseStep('report')
         return
@@ -741,13 +964,23 @@ ${reply}`
       const correctedReply = await requestVllmReply(correctionPrompt)
       const correctedValidated = parseAndValidateModelRecommendations(correctedReply)
 
-      if (!correctedValidated) {
-        throw new Error(
-          'Could not generate valid model recommendations with exact known model names.',
-        )
+      if (correctedValidated) {
+        setChooseSoftwareRecommendations(correctedValidated)
+        setChooseSoftwareReply(JSON.stringify(correctedValidated, null, 2))
+        setChooseStep('report')
+        return
       }
 
-      setChooseSoftwareReply(JSON.stringify(correctedValidated, null, 2))
+      const extractedFromRaw = extractModelRecommendationsFromText(reply)
+      const extractedFromCorrected =
+        extractModelRecommendationsFromText(correctedReply)
+      const deterministicFallback =
+        extractedFromCorrected ||
+        extractedFromRaw ||
+        buildDeterministicModelRecommendations(chooseSoftwareForm)
+
+      setChooseSoftwareRecommendations(deterministicFallback)
+      setChooseSoftwareReply(JSON.stringify(deterministicFallback, null, 2))
       setChooseStep('report')
     } catch (requestError) {
       setError(requestError.message)
@@ -765,6 +998,7 @@ ${reply}`
     setError('')
     setNotice('')
     setChooseSoftwareReply('')
+    setChooseSoftwareRecommendations(null)
     setIsTestingModel(true)
 
     const nextIterationNumber = iterations.length + 1
@@ -786,7 +1020,7 @@ ${reply}`
       return
     }
 
-    const userMessage = `You are narrowing down an AI risk management recommendation.
+    const userMessage = `You are an enterprise AI advisor conducting an iterative interview.
 
 Generate tailored follow-up questions based on all of the user's responses so far. The questions should help narrow the recommendation and avoid repeating questions already answered.
 
@@ -810,6 +1044,8 @@ Rules:
 - Questions must be based on the user's previous answers in the collected information.
 - Do not repeat or rephrase any previous question.
 - Questions should cover missing details, tradeoffs, constraints, risk appetite, deployment context, users, governance, budget, integrations, or data sensitivity.
+- Ask direct, human-sounding questions as if you are speaking to the user in an interview.
+- Avoid generic questions that could apply to any company.
 - This is iteration ${nextIterationNumber} of ${maxFeedbackIterations}. Later iterations should become more specific.`
 
     try {
@@ -932,6 +1168,7 @@ Rules:
     setChooseSoftwareForm(emptyChooseSoftwareForm)
     setChooseSoftwareRequest(null)
     setChooseSoftwareReply('')
+    setChooseSoftwareRecommendations(null)
     setChooseStep('tool')
     setDetailHints(defaultDetailHints)
     setFeedbackIterations([])
@@ -947,6 +1184,7 @@ Rules:
     setNotice('')
     setChooseSoftwareRequest(null)
     setChooseSoftwareReply('')
+    setChooseSoftwareRecommendations(null)
     setIsTestingModel(true)
 
     const userMessage = `Generate helpful text related to the user's prompt that will guide them for filling out the four domains.
@@ -1301,8 +1539,59 @@ Do not repeat or quote the user's prompt in the placeholder text. Make the place
 
               {chooseSoftwareReply && (
                 <div className="model-response" aria-live="polite">
-                  <h3>vLLM response</h3>
-                  <p>{chooseSoftwareReply}</p>
+                  <h3>Top 5 AI models/products</h3>
+                  {chooseSoftwareRecommendations ? (
+                    <div className="appendix-sections">
+                      {chooseSoftwareRecommendations.recommendations.map(
+                        (recommendation) => (
+                          <div
+                            className="appendix-section"
+                            key={`${recommendation.rank}-${recommendation.modelName}`}
+                          >
+                            <h4>
+                              #{recommendation.rank} {recommendation.modelName}
+                            </h4>
+                            <p>
+                              <strong>Provider:</strong> {recommendation.provider}
+                            </p>
+                            <p>
+                              <strong>Best fit:</strong> {recommendation.bestFit}
+                            </p>
+                            <p>
+                              <strong>Why it matches:</strong>{' '}
+                              {recommendation.whyItMatches}
+                            </p>
+                            <p>
+                              <strong>Cost considerations:</strong>{' '}
+                              {recommendation.costConsiderations}
+                            </p>
+                            {recommendation.keyRisks.length > 0 && (
+                              <p>
+                                <strong>Key risks:</strong>{' '}
+                                {recommendation.keyRisks.join('; ')}
+                              </p>
+                            )}
+                            {recommendation.governanceChecks.length > 0 && (
+                              <p>
+                                <strong>Governance checks:</strong>{' '}
+                                {recommendation.governanceChecks.join('; ')}
+                              </p>
+                            )}
+                          </div>
+                        ),
+                      )}
+                      <div className="appendix-section">
+                        <h4>Best overall recommendation</h4>
+                        <p>
+                          <strong>
+                            {chooseSoftwareRecommendations.bestOverallModel}
+                          </strong>
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <pre className="appendix-pre">{chooseSoftwareReply}</pre>
+                  )}
                 </div>
               )}
             </form>

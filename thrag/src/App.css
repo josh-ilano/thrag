@@ -235,6 +235,11 @@ textarea:focus {
   gap: 12px;
 }
 
+.question-list {
+  display: grid;
+  gap: 18px;
+}
+
 .request-preview,
 .model-response {
   border: 1px solid var(--accent-border);
